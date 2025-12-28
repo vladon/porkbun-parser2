@@ -29,14 +29,21 @@ type AuctionItem struct {
 }
 
 type ParsedPage struct {
-	Items   []AuctionItem
-	NextURL string
+	Items        []AuctionItem
+	NextURL      string
+	TotalResults int
 }
 
 func ParseAuctionsPage(pageURL string, html []byte) (ParsedPage, error) {
 	var out ParsedPage
 
 	raw := string(html)
+
+	// Parse total results (e.g. "Showing 1 - 100 out of 335481 results.")
+	totalRe := regexp.MustCompile(`(?is)\bout of\s+([0-9,]+)\s+results\b`)
+	if tm := totalRe.FindStringSubmatch(raw); len(tm) >= 2 {
+		out.TotalResults = parseIntSafe(tm[1])
+	}
 
 	// Parse rows from the auctions table body.
 	// The markup we saw is stable and simple:

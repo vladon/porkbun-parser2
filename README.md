@@ -31,6 +31,12 @@ Limit pages (useful for testing):
 ./porkbun-auctions --max-pages 3 --delay 0ms
 ```
 
+Blazingly fast (parallel fetch; may trigger 429s, retries will back off):
+
+```bash
+./porkbun-auctions --concurrency 16 --delay 0ms --out auctions.jsonl
+```
+
 ## Resume / checkpoint
 
 By default, the crawler writes a checkpoint file and will **resume automatically** if it exists:
