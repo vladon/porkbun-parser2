@@ -15,12 +15,21 @@ import (
 	"porkbun-parser2/internal/checkpoint"
 )
 
+type Logger interface {
+	Printf(format string, v ...any)
+}
+
 type CrawlerConfig struct {
 	Delay    time.Duration
 	MaxPages int
 	// Concurrency > 1 enables concurrent fetching using deterministic `?from=` pagination.
 	// This is much faster but may trigger 429s; backoff/retries will kick in automatically.
 	Concurrency int
+	// ContinueOnError makes the crawler skip pages that fail after retries (instead of aborting).
+	ContinueOnError bool
+	// LogEvery enables periodic progress logging (to Logger) when > 0.
+	LogEvery time.Duration
+	Logger   Logger
 
 	// Retry config
 	MaxRetries int
@@ -29,6 +38,8 @@ type CrawlerConfig struct {
 type CrawlStats struct {
 	Pages   int
 	Rows    int
+	Skipped int
+	Errors  int
 	LastURL string
 }
 
@@ -63,6 +74,26 @@ func (c *Crawler) Crawl(
 
 	visited := map[string]struct{}{}
 	cur := startURL
+	started := time.Now()
+	if c.cfg.Logger != nil && c.cfg.LogEvery > 0 {
+		ticker := time.NewTicker(c.cfg.LogEvery)
+		defer ticker.Stop()
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					el := time.Since(started).Seconds()
+					rps := 0.0
+					if el > 0 {
+						rps = float64(stats.Rows) / el
+					}
+					c.cfg.Logger.Printf("progress: pages=%d rows=%d skipped=%d errors=%d rps=%.1f last_url=%s", stats.Pages, stats.Rows, stats.Skipped, stats.Errors, rps, stats.LastURL)
+				}
+			}
+		}()
+	}
 
 	for cur != "" {
 		if c.cfg.MaxPages > 0 && stats.Pages >= c.cfg.MaxPages {
@@ -81,19 +112,48 @@ func (c *Crawler) Crawl(
 		default:
 		}
 
-		body, _, err := c.getWithRetries(ctx, cur)
+		parsed, body, err := c.fetchAndParseWithRetries(ctx, cur)
 		if err != nil {
+			stats.Errors++
 			stats.LastURL = cur
-			return stats, err
-		}
-
-		parsed, err := ParseAuctionsPage(cur, body)
-		if err != nil {
-			stats.LastURL = cur
-			return stats, err
+			if c.cfg.Logger != nil {
+				c.cfg.Logger.Printf("warn: failed page url=%s err=%v", cur, err)
+			}
+			if !c.cfg.ContinueOnError {
+				return stats, err
+			}
+			stats.Skipped++
+			// Try to keep moving forward using known pagination patterns.
+			if next := parsed.NextURL; next != "" {
+				cur = next
+				continue
+			}
+			if next := bumpFrom(cur, 100); next != "" && next != cur {
+				cur = next
+				continue
+			}
+			return stats, nil
 		}
 		if len(parsed.Items) == 0 {
-			return stats, fmt.Errorf("no auction rows found at %s (site may have changed / JS-only)", cur)
+			stats.Errors++
+			stats.LastURL = cur
+			reason := classifyNoRows(body)
+			if c.cfg.Logger != nil {
+				c.cfg.Logger.Printf("warn: empty page url=%s reason=%s", cur, reason)
+			}
+			if !c.cfg.ContinueOnError {
+				return stats, fmt.Errorf("no auction rows found at %s reason=%s", cur, reason)
+			}
+			stats.Skipped++
+			if next := parsed.NextURL; next != "" {
+				cur = next
+				continue
+			}
+			if next := bumpFrom(cur, 100); next != "" && next != cur {
+				cur = next
+				continue
+			}
+			return stats, nil
 		}
 
 		now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -121,6 +181,8 @@ func (c *Crawler) Crawl(
 				LastURL: stats.LastURL,
 				Pages:   stats.Pages,
 				Rows:    stats.Rows,
+				Skipped: stats.Skipped,
+				Errors:  stats.Errors,
 			})
 		}
 
@@ -158,33 +220,45 @@ func (c *Crawler) crawlConcurrent(
 	var stats CrawlStats
 	var pagesDone int64
 	var rowsDone int64
+	var skippedDone int64
+	var errorsDone int64
 
 	baseURL, startFrom, err := normalizeBaseAndFrom(startURL)
 	if err != nil {
 		return stats, err
 	}
 
-	// Fetch one page to learn total results; also validates parsing still works.
-	body, _, err := c.getWithRetries(ctx, startURL)
-	if err != nil {
-		return stats, err
+	// Discover total results. Sometimes the first page is temporarily "empty" due to soft-blocking;
+	// in that case, probe a few deterministic offsets until we find a page with rows + total count.
+	var parsed ParsedPage
+	var discovered bool
+	probeLimit := 20
+	for i := 0; i < probeLimit; i++ {
+		probeURL := startURL
+		if i > 0 {
+			probeURL = withFrom(baseURL, startFrom+i*100)
+		}
+		p, body, err := c.fetchAndParseWithRetries(ctx, probeURL)
+		if err != nil {
+			atomic.AddInt64(&errorsDone, 1)
+			if c.cfg.Logger != nil {
+				c.cfg.Logger.Printf("warn: probe failed url=%s err=%v", probeURL, err)
+			}
+			continue
+		}
+		if len(p.Items) == 0 || p.TotalResults <= 0 {
+			atomic.AddInt64(&errorsDone, 1)
+			if c.cfg.Logger != nil {
+				c.cfg.Logger.Printf("warn: probe empty url=%s reason=%s total=%d", probeURL, classifyNoRows(body), p.TotalResults)
+			}
+			continue
+		}
+		parsed = p
+		discovered = true
+		break
 	}
-	parsed, err := ParseAuctionsPage(startURL, body)
-	if err != nil {
-		return stats, err
-	}
-	if len(parsed.Items) == 0 {
-		return stats, fmt.Errorf("no auction rows found at %s (site may have changed / JS-only)", startURL)
-	}
-	if parsed.TotalResults <= 0 {
-		// Fallback: if we can't read total results, we cannot safely precompute page list.
-		// In that case, revert to sequential crawl (but keep user’s delay=0 option).
-		cSeq := NewCrawler(c.client, CrawlerConfig{
-			Delay:      c.cfg.Delay,
-			MaxPages:   c.cfg.MaxPages,
-			MaxRetries: c.cfg.MaxRetries,
-		})
-		return cSeq.Crawl(ctx, startURL, onItem, onCheckpoint)
+	if !discovered {
+		return stats, fmt.Errorf("failed to discover total results after %d probes starting at %s", probeLimit, startURL)
 	}
 
 	step := 100
@@ -219,11 +293,35 @@ func (c *Crawler) crawlConcurrent(
 	nextExpected := startFrom
 	var doneMu sync.Mutex
 	var cbMu sync.Mutex
+	started := time.Now()
+	totalTasks := len(tasks)
+
+	if c.cfg.Logger != nil && c.cfg.LogEvery > 0 {
+		ticker := time.NewTicker(c.cfg.LogEvery)
+		defer ticker.Stop()
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					p := atomic.LoadInt64(&pagesDone)
+					r := atomic.LoadInt64(&rowsDone)
+					sk := atomic.LoadInt64(&skippedDone)
+					er := atomic.LoadInt64(&errorsDone)
+					el := time.Since(started).Seconds()
+					rps := 0.0
+					if el > 0 {
+						rps = float64(r) / el
+					}
+					c.cfg.Logger.Printf("progress: pages=%d/%d rows=%d skipped=%d errors=%d rps=%.1f next_from=%d", p, totalTasks, r, sk, er, rps, nextExpected)
+				}
+			}
+		}()
+	}
 
 	taskCh := make(chan pageTask)
 	errCh := make(chan error, 1)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	worker := func() {
 		for t := range taskCh {
@@ -231,32 +329,39 @@ func (c *Crawler) crawlConcurrent(
 				return
 			}
 
-			body, _, err := c.getWithRetries(ctx, t.url)
+			parsed, body, err := c.fetchAndParseWithRetries(ctx, t.url)
 			if err != nil {
-				select {
-				case errCh <- err:
-				default:
+				atomic.AddInt64(&errorsDone, 1)
+				if c.cfg.Logger != nil {
+					c.cfg.Logger.Printf("warn: failed page url=%s err=%v", t.url, err)
 				}
-				cancel()
-				return
-			}
-
-			parsed, err := ParseAuctionsPage(t.url, body)
-			if err != nil {
-				select {
-				case errCh <- err:
-				default:
+				if !c.cfg.ContinueOnError {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
 				}
-				cancel()
-				return
+				atomic.AddInt64(&skippedDone, 1)
+				markDoneAndCheckpoint(c, &doneMu, done, &nextExpected, baseURL, 100, &cbMu, onCheckpoint, &pagesDone, &rowsDone, &skippedDone, &errorsDone, t.from)
+				continue
 			}
 			if len(parsed.Items) == 0 {
-				select {
-				case errCh <- fmt.Errorf("no auction rows found at %s (site may have changed / JS-only)", t.url):
-				default:
+				atomic.AddInt64(&errorsDone, 1)
+				reason := classifyNoRows(body)
+				if c.cfg.Logger != nil {
+					c.cfg.Logger.Printf("warn: empty page url=%s reason=%s", t.url, reason)
 				}
-				cancel()
-				return
+				if !c.cfg.ContinueOnError {
+					select {
+					case errCh <- fmt.Errorf("no auction rows found at %s reason=%s", t.url, reason):
+					default:
+					}
+					return
+				}
+				atomic.AddInt64(&skippedDone, 1)
+				markDoneAndCheckpoint(c, &doneMu, done, &nextExpected, baseURL, 100, &cbMu, onCheckpoint, &pagesDone, &rowsDone, &skippedDone, &errorsDone, t.from)
+				continue
 			}
 
 			now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -271,7 +376,6 @@ func (c *Crawler) crawlConcurrent(
 					case errCh <- err:
 					default:
 					}
-					cancel()
 					return
 				}
 			}
@@ -281,23 +385,7 @@ func (c *Crawler) crawlConcurrent(
 			atomic.AddInt64(&rowsDone, int64(len(parsed.Items)))
 
 			// Update checkpoint to next contiguous offset.
-			if onCheckpoint != nil {
-				doneMu.Lock()
-				done[t.from] = true
-				for done[nextExpected] {
-					nextExpected += step
-				}
-				nextURL := withFrom(baseURL, nextExpected)
-				doneMu.Unlock()
-
-				cbMu.Lock()
-				_ = onCheckpoint(checkpoint.State{
-					LastURL: nextURL,
-					Pages:   int(atomic.LoadInt64(&pagesDone)),
-					Rows:    int(atomic.LoadInt64(&rowsDone)),
-				})
-				cbMu.Unlock()
-			}
+			markDoneAndCheckpoint(c, &doneMu, done, &nextExpected, baseURL, 100, &cbMu, onCheckpoint, &pagesDone, &rowsDone, &skippedDone, &errorsDone, t.from)
 
 			if c.cfg.Delay > 0 {
 				tm := time.NewTimer(c.cfg.Delay)
@@ -341,6 +429,8 @@ func (c *Crawler) crawlConcurrent(
 	case err := <-errCh:
 		stats.Pages = int(atomic.LoadInt64(&pagesDone))
 		stats.Rows = int(atomic.LoadInt64(&rowsDone))
+		stats.Skipped = int(atomic.LoadInt64(&skippedDone))
+		stats.Errors = int(atomic.LoadInt64(&errorsDone))
 		stats.LastURL = withFrom(baseURL, nextExpected)
 		return stats, err
 	default:
@@ -348,6 +438,8 @@ func (c *Crawler) crawlConcurrent(
 
 	stats.Pages = int(atomic.LoadInt64(&pagesDone))
 	stats.Rows = int(atomic.LoadInt64(&rowsDone))
+	stats.Skipped = int(atomic.LoadInt64(&skippedDone))
+	stats.Errors = int(atomic.LoadInt64(&errorsDone))
 	stats.LastURL = withFrom(baseURL, nextExpected)
 	return stats, nil
 }
@@ -391,6 +483,47 @@ func (c *Crawler) getWithRetries(ctx context.Context, url string) ([]byte, int, 
 	return nil, lastStatus, lastErr
 }
 
+func (c *Crawler) fetchAndParseWithRetries(ctx context.Context, pageURL string) (ParsedPage, []byte, error) {
+	var lastBody []byte
+	var lastErr error
+
+	for attempt := 0; attempt <= c.cfg.MaxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(250*(1<<min(attempt, 6))) * time.Millisecond
+			t := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return ParsedPage{}, nil, ctx.Err()
+			case <-t.C:
+			}
+		}
+
+		body, _, err := c.getWithRetries(ctx, pageURL)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		lastBody = body
+
+		parsed, err := ParseAuctionsPage(pageURL, body)
+		if err != nil {
+			return ParsedPage{}, body, err
+		}
+		if len(parsed.Items) == 0 {
+			lastErr = fmt.Errorf("no auction rows found (reason=%s)", classifyNoRows(body))
+			// retry a few times, this can be transient soft-blocking
+			continue
+		}
+		return parsed, body, nil
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("unknown error")
+	}
+	return ParsedPage{}, lastBody, lastErr
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -426,4 +559,73 @@ func withFrom(baseURL string, from int) string {
 	}
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+func bumpFrom(cur string, step int) string {
+	u, err := url.Parse(cur)
+	if err != nil {
+		return ""
+	}
+	q := u.Query()
+	from := 0
+	if v := strings.TrimSpace(q.Get("from")); v != "" {
+		from, _ = strconv.Atoi(strings.ReplaceAll(v, ",", ""))
+	}
+	from += step
+	q.Set("from", strconv.Itoa(from))
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func classifyNoRows(body []byte) string {
+	s := strings.ToLower(string(body))
+	switch {
+	case strings.Contains(s, "captcha"):
+		return "captcha"
+	case strings.Contains(s, "access denied"):
+		return "access_denied"
+	case strings.Contains(s, "cloudflare"):
+		return "cloudflare"
+	case strings.Contains(s, "<title>") && strings.Contains(s, "porkbun"):
+		return "html_no_table"
+	default:
+		return "unknown"
+	}
+}
+
+func markDoneAndCheckpoint(
+	c *Crawler,
+	doneMu *sync.Mutex,
+	done map[int]bool,
+	nextExpected *int,
+	baseURL string,
+	step int,
+	cbMu *sync.Mutex,
+	onCheckpoint func(checkpoint.State) error,
+	pagesDone *int64,
+	rowsDone *int64,
+	skippedDone *int64,
+	errorsDone *int64,
+	from int,
+) {
+	if onCheckpoint == nil {
+		return
+	}
+	doneMu.Lock()
+	done[from] = true
+	for done[*nextExpected] {
+		*nextExpected += step
+	}
+	nextURL := withFrom(baseURL, *nextExpected)
+	doneMu.Unlock()
+
+	cbMu.Lock()
+	_ = onCheckpoint(checkpoint.State{
+		LastURL: nextURL,
+		Pages:   int(atomic.LoadInt64(pagesDone)),
+		Rows:    int(atomic.LoadInt64(rowsDone)),
+		Skipped: int(atomic.LoadInt64(skippedDone)),
+		Errors:  int(atomic.LoadInt64(errorsDone)),
+	})
+	cbMu.Unlock()
 }

@@ -37,6 +37,18 @@ Blazingly fast (parallel fetch; may trigger 429s, retries will back off):
 ./porkbun-auctions --concurrency 16 --delay 0ms --out auctions.jsonl
 ```
 
+Recommended for monitoring progress (logs to stderr, JSONL stays clean):
+
+```bash
+./porkbun-auctions --concurrency 16 --delay 0ms --log-every 2s --out auctions.jsonl
+```
+
+Don’t stop on bad pages (enabled by default):
+
+```bash
+./porkbun-auctions --continue-on-error=true
+```
+
 ## Resume / checkpoint
 
 By default, the crawler writes a checkpoint file and will **resume automatically** if it exists:

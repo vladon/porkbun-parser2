@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -24,6 +25,8 @@ func main() {
 	timeout := flag.Duration("timeout", 20*time.Second, "HTTP timeout")
 	maxPages := flag.Int("max-pages", 0, "Max pages to crawl (0 = unlimited)")
 	concurrency := flag.Int("concurrency", 1, "Number of pages to fetch concurrently (1 = sequential)")
+	continueOnError := flag.Bool("continue-on-error", true, "Skip pages that fail after retries (do not abort crawl)")
+	logEvery := flag.Duration("log-every", 5*time.Second, "Progress log interval to stderr (0 disables)")
 	checkpointPath := flag.String("checkpoint", ".porkbun-auctions.checkpoint.json", "Checkpoint file path")
 	resume := flag.Bool("resume", true, "Resume from checkpoint if present")
 	userAgent := flag.String("user-agent", "porkbun-auctions/1.0 (+https://porkbun.com/auctions)", "HTTP User-Agent")
@@ -83,10 +86,15 @@ func main() {
 		Timeout:   *timeout,
 	})
 
+	logger := log.New(os.Stderr, "", log.LstdFlags)
+
 	crawler := porkbun.NewCrawler(client, porkbun.CrawlerConfig{
-		Delay:       *delay,
-		MaxPages:    *maxPages,
-		Concurrency: *concurrency,
+		Delay:           *delay,
+		MaxPages:        *maxPages,
+		Concurrency:     *concurrency,
+		ContinueOnError: *continueOnError,
+		LogEvery:        *logEvery,
+		Logger:          logger,
 	})
 
 	stats, err := crawler.Crawl(ctx, urlToCrawl, func(item porkbun.AuctionItem) error {

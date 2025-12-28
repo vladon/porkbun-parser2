@@ -12,6 +12,8 @@ type State struct {
 	LastURL   string    `json:"last_url"`
 	Pages     int       `json:"pages"`
 	Rows      int       `json:"rows"`
+	Skipped   int       `json:"skipped,omitempty"`
+	Errors    int       `json:"errors,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
